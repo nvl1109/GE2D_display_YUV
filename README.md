@@ -5,5 +5,5 @@ To compile:
   gcc main.cpp -o HelloGE2D
   
 To run (you must be root to run):
-  sudo HelloGE2D
+  sudo ./HelloGE2D
   
