@@ -7,6 +7,11 @@
 #include <stdbool.h>
 #include <sys/ioctl.h>
 #include <linux/fb.h>
+#include <stdio.h>
+#include <errno.h>
+#include <sys/time.h>
+#include <setjmp.h>
+#include <signal.h>
 
 #include "ge2d.h"
 
@@ -15,15 +20,47 @@ const int BLUE = 0x0000ffff;
 const int RED = 0xff0000ff;
 const int BLACK = 0x000000ff;
 
+struct fb_var_screeninfo fb_vinfo;
+struct fb_fix_screeninfo fb_finfo;
+
 // Test pattern sizes
-const int testWidth = 256;
-const int testHeight = 256;
-const int testLength = testWidth * testHeight * 4; // 4 bytes per pixel
+const int testWidth = 1920;
+const int testHeight = 1080;
+const int testLength = (testWidth * testHeight * 3) / 2; // YUV size
+const char testYUVFile[] = "sampleFHD.yuv";
+
+// Global variable(s)
+bool isRunning;
+//int dmabuf_fd = -1;
+timeval startTime;
+timeval endTime;
 
 // /dev/fb1 memory location from dmesg output
-// mesonfb1(low)           : 0x07900000 - 0x07a00000 (1M)
-const unsigned long physicalAddress = 0x07900000;
+// mesonfb1(low)           : 0x7e000000
+const unsigned long physicalAddress = 0x7e000000;
 
+void ResetTime()
+{
+    gettimeofday(&startTime, NULL);
+    endTime = startTime;
+}
+
+float GetTime()
+{
+    gettimeofday(&endTime, NULL);
+    float seconds = (endTime.tv_sec - startTime.tv_sec);
+    float milliseconds = (float(endTime.tv_usec - startTime.tv_usec)) / 1000000.0f;
+
+    startTime = endTime;
+
+    return seconds + milliseconds;
+}
+
+// Signal handler for Ctrl-C
+void SignalHandler(int s)
+{
+    isRunning = false;
+}
 
 void CreateTestPattern()
 {
@@ -52,45 +89,23 @@ void CreateTestPattern()
 
     printf("virtual address = %x\n", data);
 
+    // Read YUV file into memory
+    FILE *fp = fopen(testYUVFile, "rb");
+    int tmp, total = 0;
 
-    // Create a checkerboard in memory
-    int x;
-    int y;
-
-    for (y = 0; y < testHeight; ++y)
-    {
-        for (x = 0; x < testWidth; ++x)
-        {
-            int color;
-            bool renderFlag;
-
-            if ((x & 0x20) == 0)
-            {
-                renderFlag = true;
+    do {
+        tmp = fread(data + total, 1, testLength - total, fp);
+        if (tmp > 0) {
+            total += tmp;
+        } else {
+            if (tmp < 0) {
+                fprintf(stderr, "ERR: read file %s failed, err %s\n", testYUVFile, strerror(errno));
             }
-            else
-            {
-                renderFlag = false;
-            }
-
-            if ((y & 0x20) == 0)
-            {
-                renderFlag = !renderFlag;
-            }
-
-            if (renderFlag)
-            {
-                color = RED; //RGBA
-            }
-            else
-            {
-                color = BLACK;
-            }
-
-            data[y * testWidth + x] = color;
+            break;
         }
-    }
-
+    } while (true);
+    fclose(fp);
+    fprintf(stderr, "READ %dbytes\n", total);
 
     // Clean up
     munmap(data, testLength);
@@ -134,35 +149,34 @@ void BlitTestPattern(int fd_ge2d, int dstX, int dstY, int screenWidth, int scree
     // form allows the blit source x and y read directions to be specified
     // as well as the destination x and y write directions.  Together
     // they allow overlapping blit operations to be performed.
-    config_para_ex_t configex;
-    memset(&configex, 0x00, sizeof(configex));
+    config_para_s config = { 0 };
 
-    configex.src_para.mem_type = CANVAS_ALLOC;
-    configex.src_para.format = GE2D_FORMAT_S32_RGBA;
-    configex.src_planes[0].addr = (unsigned long)physicalAddress;
-    configex.src_planes[0].w = testWidth;
-    configex.src_planes[0].h = testHeight;
-    configex.src_para.left = 0;
-    configex.src_para.top = 0;
-    configex.src_para.width = testWidth;
-    configex.src_para.height = testHeight;
-    configex.src_para.x_rev = 0;
-    configex.src_para.y_rev = 0;
+    config.src_dst_type = ALLOC_ALLOC; //ALLOC_OSD0;
+    config.alu_const_color = 0xffffffff;
+    //GE2D_FORMAT_S16_YUV422T, GE2D_FORMAT_S16_YUV422B kernel panics
+    config.src_format = GE2D_LITTLE_ENDIAN | GE2D_FORMAT_M24_NV21; //GE2D_LITTLE_ENDIAN | GE2D_FORMAT_S8_Y;
+    // Plane 0 contains Y data
+    config.src_planes[0].addr = physicalAddress;
+    config.src_planes[0].w = testWidth;
+    config.src_planes[0].h = testHeight;
+    // Plane 1 contains U data
+    config.src_planes[1].addr = config.src_planes[0].addr + (testWidth * testHeight);
+    config.src_planes[1].w = testWidth;
+    config.src_planes[1].h = testHeight / 4;
+    // Plane 2 contains V data
+    config.src_planes[2].addr = config.src_planes[1].addr + ((testWidth * testHeight) / 4);
+    config.src_planes[2].w = testWidth;
+    config.src_planes[2].h = testHeight / 4;
 
-    configex.src2_para.mem_type = CANVAS_TYPE_INVALID;
+    config.dst_format = GE2D_LITTLE_ENDIAN | GE2D_FORMAT_S32_ARGB; //GE2D_FORMAT_S32_ARGB;
+    config.dst_planes[0].addr = (unsigned long int) fb_finfo.smem_start;
+    config.dst_planes[0].w = screenWidth;
+    config.dst_planes[0].h = screenHeight;
 
-    configex.dst_para.mem_type = CANVAS_OSD0;
-    configex.dst_para.left = 0;
-    configex.dst_para.top = 0;
-    configex.dst_para.width = screenWidth;
-    configex.dst_para.height = screenHeight;
-    configex.dst_para.x_rev = 0;
-    configex.dst_para.y_rev = 0;
-
-
-    int ret = ioctl(fd_ge2d, GE2D_CONFIG_EX, &configex);
-    printf("GE2D_CONFIG_EX ret: %x\n", ret);
-
+    int ret = ioctl(fd_ge2d, GE2D_CONFIG, &config);
+    if (ret < 0) {
+        perror("GE2D_CONFIG");
+    }
 
     // Perform the blit operation
     ge2d_para_t blitRectParam2;
@@ -176,7 +190,9 @@ void BlitTestPattern(int fd_ge2d, int dstX, int dstY, int screenWidth, int scree
     blitRectParam2.dst_rect.y = dstY;
 
     ret = ioctl(fd_ge2d, GE2D_BLIT, &blitRectParam2);
-    printf("GE2D_BLIT ret: %x\n", ret);
+    if (ret < 0) {
+        perror("GE2D_BLIT");
+    }
 }
 
 int main()
@@ -195,30 +211,63 @@ int main()
         exit(1);
     }
 
-    struct fb_var_screeninfo vinfo;
-    if (ioctl(fbfd, FBIOGET_VSCREENINFO, &vinfo) == -1) {
-        perror("Error reading variable information");
+    memset(&fb_vinfo, 0, sizeof(fb_vinfo));
+    if (ioctl(fbfd, FBIOGET_VSCREENINFO, &fb_vinfo) == -1) {
+        perror("Error reading FBIOGET_VSCREENINFO");
+        exit(1);
+    }
+
+    memset(&fb_finfo, 0, sizeof(fb_finfo));
+    if (ioctl(fbfd, FBIOGET_FSCREENINFO, &fb_finfo) < 0){
+        perror("Error reading FBIOGET_FSCREENINFO");
         exit(1);
     }
 
     close(fbfd);
 
-    int screenWidth = vinfo.xres;
-    int screenHeight = vinfo.yres;
+    int screenWidth = fb_vinfo.xres;
+    int screenHeight = fb_vinfo.yres;
 
     printf("Screen size = %d x %d\n", screenWidth, screenHeight);
 
-
-
     CreateTestPattern();
 
-    FillRectangle(fd_ge2d, 0, 0, 512, 512, BLUE); // RGBA
+    FillRectangle(fd_ge2d, 0, 0, screenWidth, screenHeight, BLUE); // RGBA
 
-    BlitTestPattern(fd_ge2d, 128, 128, screenWidth, screenHeight);
+    // ----- RENDERING -----
+    int frames = 0;
+    float totalTime = 0;
+    isRunning = true;
 
+    ResetTime();
+
+    printf("Start displaying YUV file. Exit by Ctrl+C...\n");
+
+    // Trap signal to clean up
+    signal(SIGINT, SignalHandler);
+    do {
+        BlitTestPattern(fd_ge2d, 0, 0, screenWidth, screenHeight);
+
+        // FPS
+        float deltaTime = GetTime();
+
+        totalTime += deltaTime;
+        ++frames;
+
+        if (totalTime >= 5.0f)
+        {
+          int fps = (int)(frames / totalTime);
+          printf("FPS: %i, %dframes/%fs\n", fps, frames, totalTime);
+
+          frames = 0;
+          totalTime = 0;
+        }
+    } while (isRunning != 0);
 
 
     close(fd_ge2d);
+
+    printf("-EXIT!!!-\n");
 
     return 0;
 }
