@@ -14,6 +14,17 @@
 #include <signal.h>
 
 #include "ge2d.h"
+#include "ion.h"
+#include "meson_ion.h"
+
+typedef struct {
+  void *start;
+  size_t length;
+  unsigned long phys_addr;
+  ion_user_handle_t handle;
+} ion_buffer;
+
+#define CLEAR(x) memset(&(x), 0, sizeof(x))
 
 // RGBA colors
 const int BLUE = 0x0000ffff;
@@ -22,6 +33,7 @@ const int BLACK = 0x000000ff;
 
 struct fb_var_screeninfo fb_vinfo;
 struct fb_fix_screeninfo fb_finfo;
+ion_buffer ion_buf;
 
 // Test pattern sizes
 const int testWidth = 1280;
@@ -35,9 +47,12 @@ bool isRunning;
 timeval startTime;
 timeval endTime;
 
-// /dev/fb1 memory location from dmesg output
-// mesonfb1(low)           : 0x7e000000
-const unsigned long physicalAddress = 0x7e000000;
+int xioctl(int fd, int request, void *arg);
+
+void alloc_ion_buffer(int ion_fd, ion_buffer *ion_buf, int size);
+
+void free_ion_buffer(int ion_fd, ion_user_handle_t handle);
+
 
 void ResetTime()
 {
@@ -70,31 +85,12 @@ void CreateTestPattern()
     // makes the code fragile and prone to breakage should the kernel change.
     // Production code should use the kernel CMA allocator instead.
 
-
-    // Borrow physical memory from /dev/fb1
-    // Must be root
-    int fd = open("/dev/mem", O_RDWR | O_SYNC);
-    if (fd < 0)
-    {
-        printf("Can't open /dev/mem (%x)\n", fd);
-        exit(1);
-    }
-
-    int* data = (int*) mmap(0, testLength, PROT_READ|PROT_WRITE, MAP_SHARED, fd, physicalAddress);
-    if (data == NULL)
-    {
-        printf("Can't mmap\n");
-        exit(1);
-    }
-
-    printf("virtual address = %x\n", data);
-
     // Read YUV file into memory
     FILE *fp = fopen(testYUVFile, "rb");
     int tmp, total = 0;
 
     do {
-        tmp = fread(data + total, 1, testLength - total, fp);
+        tmp = fread(ion_buf.start + total, 1, testLength - total, fp);
         if (tmp > 0) {
             total += tmp;
         } else {
@@ -106,10 +102,6 @@ void CreateTestPattern()
     } while (true);
     fclose(fp);
     fprintf(stderr, "READ %dbytes\n", total);
-
-    // Clean up
-    munmap(data, testLength);
-    close(fd);
 }
 
 
@@ -158,15 +150,15 @@ void BlitTestPattern(int fd_ge2d, int dstX, int dstY, int screenWidth, int scree
     config.src_format = GE2D_LITTLE_ENDIAN | GE2D_FORMAT_M24_NV12; //GE2D_LITTLE_ENDIAN | GE2D_FORMAT_S8_Y; | GE2D_FORMAT_M24_NV21
 
     // Plane 0 contains Y data
-    config.src_planes[0].addr = physicalAddress;
+    config.src_planes[0].addr = ion_buf.phys_addr;
     config.src_planes[0].w = testWidth;
     config.src_planes[0].h = testHeight;
     // Plane 1 contains UV data
-    config.src_planes[1].addr = physicalAddress + (testWidth * testHeight);
+    config.src_planes[1].addr = ion_buf.phys_addr + (testWidth * testHeight);
     config.src_planes[1].w = testWidth;
     config.src_planes[1].h = testHeight / 2;
     // Plane 2 contains V data
-    // config.src_planes[2].addr = physicalAddress + (testWidth * testHeight * 5) / 4;
+    // config.src_planes[2].addr = ion_buf.phys_addr + (testWidth * testHeight * 5) / 4;
     // config.src_planes[2].w = testWidth;
     // config.src_planes[2].h = testHeight / 4;
 
@@ -243,6 +235,15 @@ void BlitTestPattern(int fd_ge2d, int dstX, int dstY, int screenWidth, int scree
 
 int main()
 {
+    int ion_fd = open("/dev/ion", O_RDWR);
+    if (ion_fd < 0) {
+        perror("Can't open /dev/ion");
+        exit(1);
+    }
+    // Allocate buffer
+    memset(&ion_buf, 0, sizeof(ion_buf));
+    alloc_ion_buffer(ion_fd, &ion_buf, testWidth * testHeight * 2);
+
     int fd_ge2d = open("/dev/ge2d", O_RDWR);
     if (fd_ge2d < 0)
     {
@@ -320,11 +321,99 @@ int main()
         }
     } while (isRunning != 0);
 
-
     close(fbfd);
     close(fd_ge2d);
+    if (ion_fd >= 0) {
+        free_ion_buffer(ion_fd, ion_buf.handle);
+        close(ion_fd);
+    }
 
     printf("-EXIT!!!-\n");
 
     return 0;
+}
+
+
+
+int xioctl(int fd, int request, void *arg) {
+  int r;
+
+  do {
+    r = ioctl(fd, request, arg);
+  } while (r == -1 && errno == EINTR);
+
+  return r;
+}
+
+void print_ion_buffer(ion_buffer *ion_buf) {
+  printf(
+      "ION Buffer:\n"
+      "\tAddr: %#010x\n"
+      "\tPhys Addr: %#010x\n"
+      "\tLength: %d\n"
+      "\tHandle: %d\n",
+      ion_buf->start,
+      ion_buf->phys_addr,
+      ion_buf->length,
+      ion_buf->handle);
+}
+
+void alloc_ion_buffer(int ion_fd, ion_buffer *ion_buf, int size) {
+  // ION data structures
+  struct ion_allocation_data ion_alloc_data;
+  struct ion_fd_data ion_data;
+  struct meson_phys_data meson_phys_data;
+  struct ion_custom_data ion_custom_data;
+
+  CLEAR(ion_alloc_data);
+
+  ion_alloc_data.len = size;
+
+  ion_alloc_data.heap_id_mask = ION_HEAP_CARVEOUT_MASK;
+  ion_alloc_data.flags = 0;
+  if (xioctl(ion_fd, ION_IOC_ALLOC, &ion_alloc_data) < 0)
+    perror("ION_IOC_ALLOC Failed");
+
+  CLEAR(ion_data);
+  ion_data.handle = ion_alloc_data.handle;
+  if (xioctl(ion_fd, ION_IOC_SHARE, &ion_data) < 0)
+    perror("ION_IOC_SHARE Failed");
+
+  CLEAR(meson_phys_data);
+  meson_phys_data.handle = ion_data.fd;
+
+  CLEAR(ion_custom_data);
+  ion_custom_data.cmd = ION_IOC_MESON_PHYS_ADDR;
+  ion_custom_data.arg = (long unsigned int)&meson_phys_data;
+  if (xioctl(ion_fd, ION_IOC_CUSTOM, &ion_custom_data) < 0)
+    perror("IOC_IOC_MESON_PHYS_ADDR Failed");
+
+  ion_buf->start = mmap(
+      NULL,
+      ion_alloc_data.len,
+      PROT_READ | PROT_WRITE,
+      MAP_FILE | MAP_SHARED,
+      ion_data.fd,
+      0);
+
+  if (ion_buf->start == MAP_FAILED)
+    perror("Mapping ION memory failed");
+
+  ion_buf->handle = ion_alloc_data.handle;
+  ion_buf->length = ion_alloc_data.len;
+  ion_buf->phys_addr = meson_phys_data.phys_addr;
+
+  print_ion_buffer(ion_buf);
+}
+
+void free_ion_buffer(int ion_fd, ion_user_handle_t handle) {
+  struct ion_handle_data ion_handle_data;
+
+  printf("Freeing ION buffer with handle: %d\n", handle);
+
+  CLEAR(ion_handle_data);
+  ion_handle_data.handle = handle;
+
+  if (xioctl(ion_fd, ION_IOC_FREE, &ion_handle_data) < 0)
+    perror("ION_IOC_FREE failed");
 }
