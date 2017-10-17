@@ -101,7 +101,7 @@ void CreateTestPattern()
         }
     } while (true);
     fclose(fp);
-    fprintf(stderr, "READ %dbytes\n", total);
+    fprintf(stderr, "READ %d/%dbytes\n", total, testLength);
 }
 
 
@@ -144,7 +144,7 @@ void BlitTestPattern(int fd_ge2d, int dstX, int dstY, int screenWidth, int scree
     // they allow overlapping blit operations to be performed.
     config_para_s config = { 0 };
 
-    config.src_dst_type = ALLOC_ALLOC; //ALLOC_OSD0;
+    config.src_dst_type = ALLOC_OSD0; //ALLOC_OSD0;
     config.alu_const_color = 0xffffffff;
     //GE2D_FORMAT_S16_YUV422T, GE2D_FORMAT_S16_YUV422B kernel panics
     config.src_format = GE2D_LITTLE_ENDIAN | GE2D_FORMAT_M24_NV12; //GE2D_LITTLE_ENDIAN | GE2D_FORMAT_S8_Y; | GE2D_FORMAT_M24_NV21
@@ -163,9 +163,9 @@ void BlitTestPattern(int fd_ge2d, int dstX, int dstY, int screenWidth, int scree
     // config.src_planes[2].h = testHeight / 4;
 
     config.dst_format = GE2D_LITTLE_ENDIAN | GE2D_FORMAT_S32_ARGB; //GE2D_FORMAT_S32_ARGB;
-    config.dst_planes[0].addr = (unsigned long int) fb_finfo.smem_start;
-    config.dst_planes[0].w = screenWidth;
-    config.dst_planes[0].h = screenHeight;
+    // config.dst_planes[0].addr = (unsigned long int) fb_finfo.smem_start;
+    // config.dst_planes[0].w = screenWidth;
+    // config.dst_planes[0].h = screenHeight;
 
     int ret = ioctl(fd_ge2d, GE2D_CONFIG, &config);
     if (ret < 0) {
@@ -217,19 +217,21 @@ void BlitTestPattern(int fd_ge2d, int dstX, int dstY, int screenWidth, int scree
 #endif
 
     // Perform the blit operation
-    struct ge2d_para_s blitRectParam2;
-    memset(&blitRectParam2, 0, sizeof(blitRectParam2));
+    struct ge2d_para_s blitRect;
+    memset(&blitRect, 0, sizeof(blitRect));
 
-    blitRectParam2.src1_rect.x = 0;
-    blitRectParam2.src1_rect.y = 0;
-    blitRectParam2.src1_rect.w = testWidth;
-    blitRectParam2.src1_rect.h = testHeight;
-    blitRectParam2.dst_rect.x = dstX;
-    blitRectParam2.dst_rect.y = dstY;
+    blitRect.src1_rect.x = 0;
+    blitRect.src1_rect.y = 0;
+    blitRect.src1_rect.w = testWidth;
+    blitRect.src1_rect.h = testHeight;
+    blitRect.dst_rect.x = 0;
+    blitRect.dst_rect.y = 0;
+    blitRect.dst_rect.x = dstX;
+    blitRect.dst_rect.y = dstY;
 
-    ret = ioctl(fd_ge2d, GE2D_BLIT_NOALPHA, &blitRectParam2);
+    ret = ioctl(fd_ge2d, GE2D_STRETCHBLIT_NOALPHA, &blitRect);
     if (ret < 0) {
-        perror("GE2D_BLIT");
+        perror("GE2D_BLIT_NOALPHA");
     }
 }
 
@@ -274,6 +276,7 @@ int main()
     int screenHeight = fb_vinfo.yres;
 
     printf("Screen size = %d x %d\n", screenWidth, screenHeight);
+    printf("Sample size = %d x %d\n", testWidth, testHeight);
 
     CreateTestPattern();
 
