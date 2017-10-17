@@ -16,6 +16,7 @@
 #include "ge2d.h"
 #include "ion.h"
 #include "meson_ion.h"
+#include "convert.h"
 
 typedef struct {
   void *start;
@@ -23,6 +24,8 @@ typedef struct {
   unsigned long phys_addr;
   ion_user_handle_t handle;
 } ion_buffer;
+
+#define USING_SW_YUV_RGB 0
 
 #define CLEAR(x) memset(&(x), 0, sizeof(x))
 
@@ -34,12 +37,13 @@ const int BLACK = 0x000000ff;
 struct fb_var_screeninfo fb_vinfo;
 struct fb_fix_screeninfo fb_finfo;
 ion_buffer ion_buf;
+ion_buffer ion_rgb_buf;
 
 // Test pattern sizes
-const int testWidth = 1920;
-const int testHeight = 1080;
+const int testWidth = 1280;
+const int testHeight = 768;
 const int testLength = (testWidth * testHeight * 3) / 2; // YUV size
-const char testYUVFile[] = "sample_fhd.yuv";
+const char testYUVFile[] = "sample_1280x768.yuv";
 
 // Global variable(s)
 bool isRunning;
@@ -52,7 +56,6 @@ int xioctl(int fd, int request, void *arg);
 void alloc_ion_buffer(int ion_fd, ion_buffer *ion_buf, int size);
 
 void free_ion_buffer(int ion_fd, ion_user_handle_t handle);
-
 
 void ResetTime()
 {
@@ -77,8 +80,9 @@ void SignalHandler(int s)
     isRunning = false;
 }
 
-void CreateTestPattern()
+void CreateTestPattern(void *buf)
 {
+    char *chptr = (char *)buf;
     // The GE2D hardware only works with physically contiguous bus addresses.
     // Only the kernel or a driver can provide this type of memory.  Instead of
     // including a kernel driver, this code borrows memory from /dev/fb1.  This
@@ -90,7 +94,7 @@ void CreateTestPattern()
     int tmp, total = 0;
 
     do {
-        tmp = fread(ion_buf.start + total, 1, testLength - total, fp);
+        tmp = fread(chptr + total, 1, testLength - total, fp);
         if (tmp > 0) {
             total += tmp;
         } else {
@@ -102,9 +106,19 @@ void CreateTestPattern()
     } while (true);
     fclose(fp);
     fprintf(stderr, "READ %d/%dbytes\n", total, testLength);
+    // memset(ion_buf.start + (testWidth * testHeight * 5)/4, 0, testWidth*testHeight/4);
 }
 
-
+void CreateTestPatternRgb()
+{
+    int i,j;
+    int *data = (int *)ion_rgb_buf.start;
+    for (i = 0; i < testHeight; ++i) {
+        for (j = 0; j < testWidth; ++j) {
+            data[i * testWidth + j] = 0xff00ff00; // ARGB
+        }
+    }
+}
 
 void FillRectangle(int fd_ge2d, int x, int y, int width, int height, int color)
 {
@@ -130,8 +144,6 @@ void FillRectangle(int fd_ge2d, int x, int y, int width, int height, int color)
     printf("GE2D_FILLRECTANGLE ret: %x\n", ret);
 }
 
-
-
 void BlitTestPattern(int fd_ge2d, int dstX, int dstY, int screenWidth, int screenHeight)
 {
     config_para_s config = { 0 };
@@ -139,16 +151,22 @@ void BlitTestPattern(int fd_ge2d, int dstX, int dstY, int screenWidth, int scree
     config.src_dst_type = ALLOC_OSD0; //ALLOC_OSD0;
     config.alu_const_color = 0xffffffff;
     //GE2D_FORMAT_S16_YUV422T, GE2D_FORMAT_S16_YUV422B kernel panics
-    config.src_format = GE2D_LITTLE_ENDIAN | GE2D_FORMAT_M24_NV12; //GE2D_LITTLE_ENDIAN | GE2D_FORMAT_S8_Y; | GE2D_FORMAT_M24_NV21
+#if USING_SW_YUV_RGB
+    config.src_format = GE2D_LITTLE_ENDIAN | GE2D_FORMAT_S32_ARGB;
+#else
+    config.src_format = GE2D_LITTLE_ENDIAN | GE2D_FORMAT_M24_NV12;
+#endif
 
     // Plane 0 contains Y data
-    config.src_planes[0].addr = ion_buf.phys_addr;
+    config.src_planes[0].addr = ion_rgb_buf.phys_addr;
     config.src_planes[0].w = testWidth;
     config.src_planes[0].h = testHeight;
     // Plane 1 contains UV data
-    config.src_planes[1].addr = ion_buf.phys_addr + (testWidth * testHeight);
+#if !USING_SW_YUV_RGB
+    config.src_planes[1].addr = ion_rgb_buf.phys_addr + (testWidth * testHeight);
     config.src_planes[1].w = testWidth;
     config.src_planes[1].h = testHeight / 2;
+#endif
 
     config.dst_format = GE2D_LITTLE_ENDIAN | GE2D_FORMAT_S32_ARGB; //GE2D_FORMAT_S32_ARGB;
     // config.dst_planes[0].addr = (unsigned long int) fb_finfo.smem_start;
@@ -187,8 +205,10 @@ int main()
         exit(1);
     }
     // Allocate buffer
-    memset(&ion_buf, 0, sizeof(ion_buf));
-    alloc_ion_buffer(ion_fd, &ion_buf, testWidth * testHeight * 2);
+    // memset(&ion_buf, 0, sizeof(ion_buf));
+    // alloc_ion_buffer(ion_fd, &ion_buf, testWidth * testHeight * 2);
+    memset(&ion_rgb_buf, 0, sizeof(ion_rgb_buf));
+    alloc_ion_buffer(ion_fd, &ion_rgb_buf, testWidth * testHeight * 4);
 
     int fd_ge2d = open("/dev/ge2d", O_RDWR);
     if (fd_ge2d < 0)
@@ -222,7 +242,19 @@ int main()
     printf("Screen size = %d x %d\n", screenWidth, screenHeight);
     printf("Sample size = %d x %d\n", testWidth, testHeight);
 
-    CreateTestPattern();
+#if USING_SW_YUV_RGB
+    char *yuvData = (char *)malloc(testWidth*testHeight*2);
+    CreateTestPattern(yuvData);
+#else
+    CreateTestPattern(ion_rgb_buf.start);
+#endif /* USING_SW_YUV_RGB */
+
+#if USING_SW_YUV_RGB
+    ResetTime();
+    chroma::NV21ToRGB32(yuvData, ion_rgb_buf.start, testWidth, testHeight);
+    printf("NV21ToRGB32 time: %f\n", GetTime());
+    free(yuvData);
+#endif
 
     FillRectangle(fd_ge2d, 0, 0, screenWidth, screenHeight, BLUE); // RGBA
 
@@ -271,7 +303,8 @@ int main()
     close(fbfd);
     close(fd_ge2d);
     if (ion_fd >= 0) {
-        free_ion_buffer(ion_fd, ion_buf.handle);
+        // free_ion_buffer(ion_fd, ion_buf.handle);
+        free_ion_buffer(ion_fd, ion_rgb_buf.handle);
         close(ion_fd);
     }
 

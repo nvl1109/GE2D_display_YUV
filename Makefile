@@ -3,7 +3,7 @@ TARGET = HelloGE2D
 CC = gcc
 CFLAGS = -O2
 LDFLAGS =
-SRCS = main.cpp
+SRCS = main.cpp convert.cpp
 LIBS =
 
 OBJS=$(SRCS:%.cpp=%.o)
