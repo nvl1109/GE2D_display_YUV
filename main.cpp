@@ -40,10 +40,10 @@ ion_buffer ion_buf;
 ion_buffer ion_rgb_buf;
 
 // Test pattern sizes
-const int testWidth = 1280;
-const int testHeight = 768;
+const int testWidth = 3840;
+const int testHeight = 1920;
 const int testLength = (testWidth * testHeight * 3) / 2; // YUV size
-const char testYUVFile[] = "sample_1280x768.yuv";
+const char testYUVFile[] = "sample_4k.yuv";
 
 // Global variable(s)
 bool isRunning;
@@ -188,10 +188,10 @@ void BlitTestPattern(int fd_ge2d, int dstX, int dstY, int screenWidth, int scree
     blitRect.src1_rect.h = testHeight;
     blitRect.dst_rect.x = 0;
     blitRect.dst_rect.y = 0;
-    blitRect.dst_rect.x = dstX;
-    blitRect.dst_rect.y = dstY;
+    blitRect.dst_rect.w = testWidth;
+    blitRect.dst_rect.h = testHeight;
 
-    ret = ioctl(fd_ge2d, GE2D_BLIT_NOALPHA, &blitRect);
+    ret = ioctl(fd_ge2d, GE2D_STRETCHBLIT_NOALPHA, &blitRect);
     if (ret < 0) {
         perror("GE2D_BLIT_NOALPHA");
     }
