@@ -80,7 +80,7 @@ void CreateTestPattern()
         exit(1);
     }
 
-    int* data = (int*) mmap(0, testLength, PROT_READ|PROT_WRITE, MAP_SHARED, fd, physicalAddress);
+    int* data = (int*) mmap(0, 0x01000000, PROT_READ|PROT_WRITE, MAP_SHARED, fd, physicalAddress);
     if (data == NULL)
     {
         printf("Can't mmap\n");
@@ -93,8 +93,10 @@ void CreateTestPattern()
     FILE *fp = fopen(testYUVFile, "rb");
     int tmp, total = 0;
 
+    // first zone
+    char *dataptr = (char *)data;
     do {
-        tmp = fread(data + total, 1, testLength - total, fp);
+        tmp = fread(dataptr + total, 1, testLength - total, fp);
         if (tmp > 0) {
             total += tmp;
         } else {
@@ -104,11 +106,16 @@ void CreateTestPattern()
             break;
         }
     } while (true);
+
     fclose(fp);
     fprintf(stderr, "READ %dbytes\n", total);
 
+    memcpy(dataptr + testLength, dataptr, testLength);
+    memcpy(dataptr + testLength * 2, dataptr, testLength);
+    memcpy(dataptr + testLength * 3, dataptr, testLength);
+
     // Clean up
-    munmap(data, testLength);
+    munmap(data, 0x01000000);
     close(fd);
 }
 
@@ -140,7 +147,7 @@ void FillRectangle(int fd_ge2d, int x, int y, int width, int height, int color)
 
 
 
-void BlitTestPattern(int fd_ge2d, int dstX, int dstY, int screenWidth, int screenHeight)
+void BlitTestPattern(void *addr, int fd_ge2d, int dstX, int dstY, int screenWidth, int screenHeight)
 {
     // Tell the hardware we will source memory (that we borrowed)
     // and write to /dev/fb0
@@ -151,27 +158,20 @@ void BlitTestPattern(int fd_ge2d, int dstX, int dstY, int screenWidth, int scree
     // they allow overlapping blit operations to be performed.
     config_para_s config = { 0 };
 
-    config.src_dst_type = ALLOC_ALLOC; //ALLOC_OSD0;
+    config.src_dst_type = ALLOC_OSD0; //ALLOC_OSD0;
     config.alu_const_color = 0xffffffff;
     //GE2D_FORMAT_S16_YUV422T, GE2D_FORMAT_S16_YUV422B kernel panics
-    config.src_format = GE2D_LITTLE_ENDIAN | GE2D_FORMAT_M24_NV21; //GE2D_LITTLE_ENDIAN | GE2D_FORMAT_S8_Y;
+    config.src_format = GE2D_LITTLE_ENDIAN | GE2D_FORMAT_M24_NV12; //GE2D_LITTLE_ENDIAN | GE2D_FORMAT_S8_Y;
     // Plane 0 contains Y data
-    config.src_planes[0].addr = physicalAddress;
+    config.src_planes[0].addr = (unsigned long)addr;
     config.src_planes[0].w = testWidth;
     config.src_planes[0].h = testHeight;
-    // Plane 1 contains U data
+    // Plane 1 contains UV data
     config.src_planes[1].addr = config.src_planes[0].addr + (testWidth * testHeight);
     config.src_planes[1].w = testWidth;
-    config.src_planes[1].h = testHeight / 4;
-    // Plane 2 contains V data
-    config.src_planes[2].addr = config.src_planes[1].addr + ((testWidth * testHeight) / 4);
-    config.src_planes[2].w = testWidth;
-    config.src_planes[2].h = testHeight / 4;
+    config.src_planes[1].h = testHeight / 2;
 
     config.dst_format = GE2D_LITTLE_ENDIAN | GE2D_FORMAT_S32_ARGB; //GE2D_FORMAT_S32_ARGB;
-    config.dst_planes[0].addr = (unsigned long int) fb_finfo.smem_start;
-    config.dst_planes[0].w = screenWidth;
-    config.dst_planes[0].h = screenHeight;
 
     int ret = ioctl(fd_ge2d, GE2D_CONFIG, &config);
     if (ret < 0) {
@@ -188,10 +188,12 @@ void BlitTestPattern(int fd_ge2d, int dstX, int dstY, int screenWidth, int scree
     blitRectParam2.src1_rect.h = testHeight;
     blitRectParam2.dst_rect.x = dstX;
     blitRectParam2.dst_rect.y = dstY;
+    blitRectParam2.dst_rect.w = screenWidth;
+    blitRectParam2.dst_rect.h = screenHeight;
 
-    ret = ioctl(fd_ge2d, GE2D_BLIT, &blitRectParam2);
+    ret = ioctl(fd_ge2d, GE2D_STRETCHBLIT_NOALPHA, &blitRectParam2);
     if (ret < 0) {
-        perror("GE2D_BLIT");
+        perror("GE2D_STRETCHBLIT_NOALPHA");
     }
 }
 
@@ -238,6 +240,7 @@ int main()
     int frames = 0;
     float totalTime = 0;
     isRunning = true;
+    char *dataptr = (char *)physicalAddress;
 
     ResetTime();
 
@@ -246,7 +249,19 @@ int main()
     // Trap signal to clean up
     signal(SIGINT, SignalHandler);
     do {
-        BlitTestPattern(fd_ge2d, 0, 0, screenWidth, screenHeight);
+        BlitTestPattern(dataptr, fd_ge2d, 0, 0, testWidth, testHeight);
+        BlitTestPattern(dataptr + testLength, fd_ge2d, testWidth, 0, testWidth, testHeight);
+        BlitTestPattern(dataptr + testLength * 2, fd_ge2d, 0, testHeight, testWidth, testHeight);
+        BlitTestPattern(dataptr + testLength * 3, fd_ge2d, testWidth, testHeight, testWidth, testHeight);
+
+        // Flip
+        ioctl(fbfd, FBIOPAN_DISPLAY, &fb_vinfo);
+
+        // Wait for vsync
+        // The normal order is to wait for vsync and then pan,
+        // but its done backwards due to the wait its implemented
+        // by Amlogic (non-syncronous).
+        ioctl(fbfd, FBIO_WAITFORVSYNC, 0);
 
         // FPS
         float deltaTime = GetTime();
@@ -256,8 +271,8 @@ int main()
 
         if (totalTime >= 5.0f)
         {
-          int fps = (int)(frames / totalTime);
-          printf("FPS: %i, %dframes/%fs\n", fps, frames, totalTime);
+          float fps = (frames / totalTime);
+          printf("FPS: %.1f, %dframes/%fs\n", fps, frames, totalTime);
 
           frames = 0;
           totalTime = 0;
